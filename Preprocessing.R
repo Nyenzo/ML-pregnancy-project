@@ -1,0 +1,282 @@
+# Load Libraries
+library(tidyr)
+library(R.utils)
+library(dplyr)
+library(randomForest)
+library(ggplot2)
+library(haven)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(smotefamily)  # For SMOTE to balance classes
+library(performanceEstimation)  # Alternative SMOTE implementation
+
+# Install smotefamily and performanceEstimation if not already installed
+if (!require(smotefamily)) {
+  install.packages("smotefamily")
+  library(smotefamily)
+}
+if (!require(performanceEstimation)) {
+  install.packages("performanceEstimation")
+  library(performanceEstimation)
+}
+
+# Load Data
+df <- read.csv("data_safi.csv")
+print("Initial number of rows in df:")
+print(nrow(df))
+
+# Define Outcome
+df$apo_general <- factor(df$apo_general, levels = c("NonAPO", "APO"))
+
+# Recode Predictors
+df <- df %>%
+  mutate(
+    across(starts_with("cesarean_birth_"), ~ haven::zap_labels(.)),
+    across(starts_with("timing_first_antenatal_check_"), ~ ifelse(. > 9, NA, .)),
+    across(starts_with("num_antenatal_visits_"), ~ ifelse(. > 12, NA, .)),
+    across(starts_with("tetanus_during_pregnancy_"), ~ ifelse(. > 5, NA, .)),
+    across(starts_with("tetanus_before_birth_"), ~ ifelse(. > 5, NA, .)),
+    across(starts_with("succeeding_birth_interval_"), ~ ifelse(. > 120 | . < 0, NA, .)),
+    age_at_first_birth = ifelse(age_at_first_birth < 10 | age_at_first_birth > 50, NA, age_at_first_birth),
+    age_at_first_birth_cat = case_when(
+      age_at_first_birth < 19 ~ "Below 19",
+      age_at_first_birth >= 19 & age_at_first_birth <= 35 ~ "19-35",
+      age_at_first_birth > 35 ~ "Above 35",
+      TRUE ~ NA_character_
+    ),
+    age_at_first_birth_cat = factor(age_at_first_birth_cat, levels = c("Below 19", "19-35", "Above 35")),
+    across(starts_with("abused_during_pregnancy_"), ~ ifelse(. %in% c(0, 1), ., NA)),
+    prop_abused_during_pregnancy = rowMeans(select(., starts_with("abused_during_pregnancy_")) == 1, na.rm = TRUE),
+    # Handle cases where all values are NA (rowMeans returns NaN)
+    prop_abused_during_pregnancy = ifelse(is.nan(prop_abused_during_pregnancy), 0, prop_abused_during_pregnancy),
+    abused_during_pregnancy = factor(ifelse(prop_abused_during_pregnancy > 0, "Yes", "No"), levels = c("No", "Yes")),
+    across(starts_with("size_of_child_"), ~ ifelse(. %in% 1:5, ., NA)),
+    avg_size_of_child = rowMeans(select(., starts_with("size_of_child_")), na.rm = TRUE),
+    avg_size_of_child = ifelse(rowSums(is.na(select(., starts_with("size_of_child_")))) == length(select(., starts_with("size_of_child_"))), NA, avg_size_of_child),
+    avg_succeeding_birth_interval = rowMeans(select(., starts_with("succeeding_birth_interval_")), na.rm = TRUE),
+    prop_short_succeeding_interval = rowMeans(select(., starts_with("succeeding_birth_interval_")) < 24, na.rm = TRUE),
+    avg_timing_first_antenatal_check = rowMeans(select(., starts_with("timing_first_antenatal_check_")), na.rm = TRUE),
+    avg_num_antenatal_visits = rowMeans(select(., starts_with("num_antenatal_visits_")), na.rm = TRUE),
+    avg_tetanus_before_birth = rowMeans(select(., starts_with("tetanus_before_birth_")), na.rm = TRUE),
+    avg_tetanus_during_pregnancy = rowMeans(select(., starts_with("tetanus_during_pregnancy_")), na.rm = TRUE),
+    prop_cesarean = rowMeans(select(., starts_with("cesarean_birth_")) == 1, na.rm = TRUE),
+    wealth_index = factor(wealth_index, levels = c(1, 2, 3, 4, 5), 
+                          labels = c("Poorest", "Poorer", "Middle", "Richer", "Richest")),
+    highest_education_level = factor(highest_education_level, 
+                                     levels = c(0, 1, 2, 3), 
+                                     labels = c("No Education", "Primary", "Secondary", "Higher")),
+    contraceptive_category = case_when(
+      current_contraceptive_method == 0 ~ "None",
+      current_contraceptive_method %in% c(1, 2, 3, 5, 6, 7, 11, 14, 16, 17, 18) ~ "Modern",
+      current_contraceptive_method %in% c(8, 9, 10, 13) ~ "Traditional",
+      TRUE ~ "Other"
+    ),
+    contraceptive_category = factor(contraceptive_category, 
+                                    levels = c("None", "Modern", "Traditional", "Other"))
+  )
+print("Number of rows after recoding:")
+print(nrow(df))
+
+# Address Negative Values in avg_succeeding_birth_interval
+df <- df %>%
+  mutate(
+    avg_succeeding_birth_interval = ifelse(avg_succeeding_birth_interval < 0, NA, avg_succeeding_birth_interval),
+    prop_short_succeeding_interval = ifelse(is.na(avg_succeeding_birth_interval), NA, prop_short_succeeding_interval)
+  )
+
+# Impute Missing Values for Numeric Variables Using Median
+# Add a check to handle cases where all values are NA
+df <- df %>%
+  mutate(
+    avg_timing_first_antenatal_check = ifelse(is.na(avg_timing_first_antenatal_check), 
+                                              if (all(is.na(avg_timing_first_antenatal_check))) 0 else median(avg_timing_first_antenatal_check, na.rm = TRUE), 
+                                              avg_timing_first_antenatal_check),
+    avg_num_antenatal_visits = ifelse(is.na(avg_num_antenatal_visits), 
+                                      if (all(is.na(avg_num_antenatal_visits))) 0 else median(avg_num_antenatal_visits, na.rm = TRUE), 
+                                      avg_num_antenatal_visits),
+    prop_cesarean = ifelse(is.na(prop_cesarean), 
+                           if (all(is.na(prop_cesarean))) 0 else median(prop_cesarean, na.rm = TRUE), 
+                           prop_cesarean),
+    avg_tetanus_during_pregnancy = ifelse(is.na(avg_tetanus_during_pregnancy), 
+                                          if (all(is.na(avg_tetanus_during_pregnancy))) 0 else median(avg_tetanus_during_pregnancy, na.rm = TRUE), 
+                                          avg_tetanus_during_pregnancy),
+    avg_succeeding_birth_interval = ifelse(is.na(avg_succeeding_birth_interval), 
+                                           if (all(is.na(avg_succeeding_birth_interval))) 0 else median(avg_succeeding_birth_interval, na.rm = TRUE), 
+                                           avg_succeeding_birth_interval),
+    prop_short_succeeding_interval = ifelse(is.na(prop_short_succeeding_interval), 
+                                            if (all(is.na(prop_short_succeeding_interval))) 0 else median(prop_short_succeeding_interval, na.rm = TRUE), 
+                                            prop_short_succeeding_interval),
+    avg_tetanus_before_birth = ifelse(is.na(avg_tetanus_before_birth), 
+                                      if (all(is.na(avg_tetanus_before_birth))) 0 else median(avg_tetanus_before_birth, na.rm = TRUE), 
+                                      avg_tetanus_before_birth),
+    avg_size_of_child = ifelse(is.na(avg_size_of_child), 
+                               if (all(is.na(avg_size_of_child))) 0 else median(avg_size_of_child, na.rm = TRUE), 
+                               avg_size_of_child),
+    total_pregnancies = ifelse(is.na(total_pregnancies), 
+                               if (all(is.na(total_pregnancies))) 0 else median(total_pregnancies, na.rm = TRUE), 
+                               total_pregnancies)
+  )
+
+# Impute Missing Values for Categorical Variables Using Mode
+mode_impute <- function(x) {
+  ux <- unique(x[!is.na(x)])
+  if (length(ux) == 0) return("No")  # Default to "No" if all values are NA (for abused_during_pregnancy)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+df <- df %>%
+  mutate(
+    place_of_residence = ifelse(is.na(place_of_residence), 
+                                mode_impute(place_of_residence), 
+                                place_of_residence),
+    wealth_index = ifelse(is.na(wealth_index), 
+                          mode_impute(wealth_index), 
+                          wealth_index),
+    highest_education_level = ifelse(is.na(highest_education_level), 
+                                     mode_impute(highest_education_level), 
+                                     highest_education_level),
+    age_at_first_birth_cat = ifelse(is.na(age_at_first_birth_cat), 
+                                    mode_impute(age_at_first_birth_cat), 
+                                    age_at_first_birth_cat),
+    abused_during_pregnancy = ifelse(is.na(abused_during_pregnancy), 
+                                     mode_impute(abused_during_pregnancy), 
+                                     abused_during_pregnancy),
+    contraceptive_category = ifelse(is.na(contraceptive_category), 
+                                    mode_impute(contraceptive_category), 
+                                    contraceptive_category)
+  )
+
+# Check for Remaining Missing Values
+missing_summary <- colSums(is.na(df))
+print("Missing Values per Column After Imputation:")
+print(missing_summary)
+
+# Filter Rows with Non-Missing apo_general
+df <- df %>%
+  filter(!is.na(apo_general))
+print("Number of rows after filtering non-missing apo_general:")
+print(nrow(df))
+
+# Drop Rows with Missing Values in Key Variables, Excluding avg_size_of_child and abused_during_pregnancy
+df <- df %>%
+  drop_na(avg_timing_first_antenatal_check, avg_num_antenatal_visits, prop_cesarean, 
+          place_of_residence, wealth_index, highest_education_level, 
+          avg_tetanus_during_pregnancy, avg_succeeding_birth_interval, 
+          prop_short_succeeding_interval, avg_tetanus_before_birth, 
+          age_at_first_birth_cat, total_pregnancies, contraceptive_category)
+print("Number of rows after drop_na (excluding avg_size_of_child and abused_during_pregnancy):")
+print(nrow(df))
+
+# Check if df has enough rows
+if (nrow(df) < 2) {
+  stop("Error: After preprocessing, the dataset has fewer than 2 rows. Check for excessive missing data or filtering.")
+}
+
+# Split Data into Training and Testing Sets
+set.seed(123)
+trainIndex <- createDataPartition(df$apo_general, p = 0.7, list = FALSE)
+train_data <- df[trainIndex, ]
+test_data <- df[-trainIndex, ]
+print("Number of rows in training set:")
+print(nrow(train_data))
+print("Number of rows in test set:")
+print(nrow(test_data))
+
+# Prepare Data for SMOTE
+# SMOTE requires features (X) and target (Y) separately
+predictors <- c("avg_timing_first_antenatal_check", "avg_num_antenatal_visits", 
+                "prop_cesarean", "place_of_residence", "wealth_index", 
+                "highest_education_level", "avg_tetanus_during_pregnancy", 
+                "avg_succeeding_birth_interval", "prop_short_succeeding_interval", 
+                "avg_tetanus_before_birth", "age_at_first_birth_cat", 
+                "avg_size_of_child", "total_pregnancies", "contraceptive_category")
+
+# Extract features (X) and target (Y) from training data
+train_X <- train_data[, predictors, drop = FALSE]  # Ensure train_X is a data frame
+train_Y <- train_data$apo_general
+
+# Ensure categorical variables are factors
+train_X <- train_X %>%
+  mutate(
+    place_of_residence = as.factor(place_of_residence),
+    wealth_index = as.factor(wealth_index),
+    highest_education_level = as.factor(highest_education_level),
+    age_at_first_birth_cat = as.factor(age_at_first_birth_cat),
+    contraceptive_category = as.factor(contraceptive_category)
+  )
+
+# Convert categorical variables to dummy variables, as SMOTE requires numeric input
+train_X <- model.matrix(~ . - 1, data = train_X)  # Creates dummy variables for categorical predictors
+
+# Debug: Check class distribution and data format
+print("Class Distribution in Training Set (Before SMOTE):")
+print(table(train_Y))
+print("Dimensions of train_X:")
+print(dim(train_X))
+print("Sample of train_X:")
+print(head(train_X[, 1:5]))  # Print first 5 columns for inspection
+print("Levels of train_Y:")
+print(levels(train_Y))
+
+# Check if there are enough minority samples
+minority_count <- sum(train_Y == "APO")
+majority_count <- sum(train_Y == "NonAPO")
+if (minority_count < 5) {
+  warning("Fewer than 5 minority class samples (APO). SMOTE may fail. Falling back to caret::upSample.")
+  # Fallback to caret::upSample
+  set.seed(123)
+  train_data_smote <- caret::upSample(x = train_data[, predictors], 
+                                      y = train_data$apo_general, 
+                                      yname = "apo_general")
+} else {
+  # Try smotefamily::SMOTE with adjusted parameters
+  set.seed(123)
+  dup_size <- 1  # Reduce dup_size to generate fewer synthetic samples
+  smote_success <- tryCatch({
+    smote_result <- smotefamily::SMOTE(X = train_X, target = train_Y, dup_size = dup_size, K = 3)  # Reduce K to 3
+    train_data_smote <- smote_result$data
+    colnames(train_data_smote)[ncol(train_data_smote)] <- "apo_general"
+    train_data_smote$apo_general <- factor(train_data_smote$apo_general, levels = c("NonAPO", "APO"))
+    TRUE
+  }, error = function(e) {
+    message("smotefamily::SMOTE failed: ", e$message)
+    FALSE
+  })
+  
+  if (!smote_success) {
+    # Fallback to performanceEstimation::smote with a timeout
+    message("Trying performanceEstimation::smote...")
+    set.seed(123)
+    train_data_combined <- as.data.frame(train_X)
+    train_data_combined$apo_general <- train_Y
+    # Use withTimeout to prevent hanging
+    smote_success_pe <- tryCatch({
+      withTimeout({
+        # perc.over = 100 means double the minority class (similar to dup_size = 1)
+        # perc.under = 200 means majority class is twice the new minority class size
+        smote_result <- performanceEstimation::smote(apo_general ~ ., data = train_data_combined, 
+                                                     perc.over = 100, perc.under = 200, k = 3)
+        train_data_smote <- smote_result
+        train_data_smote$apo_general <- factor(train_data_smote$apo_general, levels = c("NonAPO", "APO"))
+        TRUE
+      }, timeout = 300)  # Timeout after 5 minutes
+    }, error = function(e) {
+      message("performanceEstimation::smote failed or timed out: ", e$message)
+      FALSE
+    })
+    
+    if (!smote_success_pe) {
+      # Fallback to caret::upSample
+      message("Falling back to caret::upSample...")
+      set.seed(123)
+      train_data_smote <- caret::upSample(x = train_data[, predictors], 
+                                          y = train_data$apo_general, 
+                                          yname = "apo_general")
+    }
+  }
+}
+
+# Print Class Distribution After Balancing
+print("Class Distribution After Balancing:")
+print(table(train_data_smote$apo_general))
